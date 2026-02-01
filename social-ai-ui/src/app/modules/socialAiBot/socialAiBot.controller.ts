@@ -30,6 +30,7 @@ type LiveMsg = {
   conversationId: string;
   customerName: string;
   customerProfilePic?: string;
+  replyToMessageId?: string | number | null;
   sender: "customer" | "bot";
   senderRole?: "customer" | "admin" | "seller" | "ai";
   senderName?: string;
@@ -424,6 +425,36 @@ const guessExtFromUrl = (u: string): string => {
   } catch {}
   return "";
 };
+
+
+const guessMimeFromUrl = (u: string): string => {
+  const ext = guessExtFromUrl(u).toLowerCase();
+  if (ext === ".jpg" || ext === ".jpeg") return "image/jpeg";
+  if (ext === ".png") return "image/png";
+  if (ext === ".gif") return "image/gif";
+  if (ext === ".webp") return "image/webp";
+  if (ext === ".mp4") return "video/mp4";
+  if (ext === ".mov") return "video/quicktime";
+  if (ext === ".m4v") return "video/mp4";
+  if (ext === ".pdf") return "application/pdf";
+  // generic fallbacks
+  return "";
+};
+
+const fetchRemoteContentType = async (url: string): Promise<string> => {
+  try {
+    const resp = await axios.head(url, {
+      maxRedirects: 5,
+      timeout: 4000,
+      validateStatus: (s) => s >= 200 && s < 400,
+    });
+    const ct = String((resp.headers as any)?.["content-type"] || "").split(";")[0].trim();
+    return ct;
+  } catch {
+    return "";
+  }
+};
+
 
 const downloadRemoteMediaToUploads = async (remoteUrl: string): Promise<string | null> => {
   try {

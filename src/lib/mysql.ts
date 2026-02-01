@@ -95,7 +95,19 @@ CREATE TABLE IF NOT EXISTS saved_templates (
     await queryRows(createSavedTemplates);
   }
 
-  const auto = String(process.env.MYSQL_AUTO_MIGRATE || "").toLowerCase();
+  
+  // Ensure reply thread support column exists (backward compatible).
+  try {
+    await queryRows("SELECT reply_to_message_id FROM social_chat_messages LIMIT 1");
+  } catch {
+    try {
+      await queryRows("ALTER TABLE social_chat_messages ADD COLUMN reply_to_message_id VARCHAR(36) NULL");
+    } catch {
+      // ignore (table may not exist yet in fresh install; auto-migrate will create it)
+    }
+  }
+
+const auto = String(process.env.MYSQL_AUTO_MIGRATE || "").toLowerCase();
   if (!(auto === "1" || auto === "true" || auto === "yes")) return;
 
   const schemaSql = `
@@ -136,13 +148,15 @@ CREATE TABLE IF NOT EXISTS social_chat_messages (
   sender_role ENUM('customer','admin','seller','ai') DEFAULT 'customer',
   sender_name VARCHAR(255) DEFAULT '',
   message MEDIUMTEXT NOT NULL,
+  reply_to_message_id VARCHAR(36) NULL,
   platform ENUM('facebook','instagram') NOT NULL,
   page_id VARCHAR(64) NOT NULL,
   timestamp DATETIME NOT NULL,
   created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   KEY idx_conv_time (conversation_id, timestamp),
-  KEY idx_time (timestamp)
+  KEY idx_time (timestamp),
+  KEY idx_reply (reply_to_message_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 -- ✅ API Integrations (FB/IG/WhatsApp)

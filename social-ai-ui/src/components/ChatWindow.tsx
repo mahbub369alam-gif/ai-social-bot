@@ -58,8 +58,99 @@ export default function ChatWindow({
     return {} as Record<string, string>;
   }, [isAdmin]);;
 
-  const [text, setText] = useState("");
+  
+  // --- Media parsing helpers (for reply preview / rendering) ---
+  const toAbsoluteMediaUrl = (u: string) => {
+    const url = (u || "").trim();
+    if (!url) return "";
+    if (url.startsWith("http://") || url.startsWith("https://")) return url;
+    if (url.startsWith("/")) return `${API}${url}`;
+    return `${API}/${url}`;
+  };
+
+  const isImageUrl = (u: string) => {
+    const url = u.toLowerCase();
+    return (
+      url.includes(".png") ||
+      url.includes(".jpg") ||
+      url.includes(".jpeg") ||
+      url.includes(".gif") ||
+      url.includes(".webp") ||
+      url.includes("image/")
+    );
+  };
+
+  const extractUrlsFromText = (s: string) => {
+    const out: string[] = [];
+    const str = String(s || "");
+    // Pull urls from lines first (common saved format: "Images:\n/uploads/..")
+    for (const line of str.split(/\r?\n/)) {
+      const t = line.trim();
+      if (!t) continue;
+      if (t.startsWith("/uploads/") || t.startsWith("http://") || t.startsWith("https://")) out.push(t);
+    }
+    // Also catch inline urls
+    const reUrl = /(https?:\/\/[^\s]+|\/uploads\/[^\s]+)/g;
+    let m: RegExpExecArray | null;
+    while ((m = reUrl.exec(str))) out.push(m[1]);
+    // de-dupe
+    return Array.from(new Set(out));
+  };
+
+  const parseMediaMessage = (msg: string) => {
+    const raw = String(msg || "");
+    const urls = extractUrlsFromText(raw).map(toAbsoluteMediaUrl).filter(Boolean);
+    const images = urls.filter(isImageUrl);
+    return { images, urls, raw };
+  };
+
+const [text, setText] = useState("");
   const [sending, setSending] = useState(false);
+  const [replyTo, setReplyTo] = useState<LiveMsg | null>(null);
+  const dragStateRef = useRef<{ id: string | null; startX: number; delta: number }>({ id: null, startX: 0, delta: 0 });
+  const [draggingMsgId, setDraggingMsgId] = useState<string | null>(null);
+  const [dragDeltaX, setDragDeltaX] = useState<number>(0);
+
+// 🔎 In-chat search
+const [searchOpen, setSearchOpen] = useState(false);
+const [searchQ, setSearchQ] = useState("");
+const [activeMatch, setActiveMatch] = useState(0);
+const msgRefs = useRef<Record<string, HTMLDivElement | null>>({});
+
+const normalizedSearch = searchQ.trim().toLowerCase();
+const matchKeys = useMemo(() => {
+  if (!normalizedSearch) return [] as string[];
+  const keys: string[] = [];
+  messages.forEach((m, idx) => {
+    const hay = String(m.message || "").toLowerCase();
+    if (hay.includes(normalizedSearch)) {
+      const k = String(m.id ?? (m as any).messageId ?? `${idx}-${m.timestamp ?? ""}`);
+      keys.push(k);
+    }
+  });
+  return keys;
+}, [messages, normalizedSearch]);
+
+const matchSet = useMemo(() => new Set(matchKeys), [matchKeys]);
+
+const jumpToMatch = (i: number) => {
+  if (!matchKeys.length) return;
+  const next = (i + matchKeys.length) % matchKeys.length;
+  setActiveMatch(next);
+  const key = matchKeys[next];
+  const el = msgRefs.current[key];
+  if (el) el.scrollIntoView({ behavior: "smooth", block: "center" });
+};
+
+useEffect(() => {
+  // When query changes, jump to first match
+  if (normalizedSearch && matchKeys.length) {
+    setActiveMatch(0);
+    const el = msgRefs.current[matchKeys[0]];
+    if (el) el.scrollIntoView({ behavior: "smooth", block: "center" });
+  }
+  if (normalizedSearch && !matchKeys.length) setActiveMatch(0);
+}, [normalizedSearch, matchKeys.length]);
 
   const [files, setFiles] = useState<File[]>([]);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -258,7 +349,7 @@ export default function ChatWindow({
         const res = await fetch(`${API}/api/social-ai-bot/manual-reply`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', ...authHeaders },
-          body: JSON.stringify({ conversationId, message: msg }),
+          body: JSON.stringify({ conversationId, message: msg, replyToMessageId: (replyTo as any)?.id || null }),
         });
         const t = await res.text();
         if (!res.ok) {
@@ -502,7 +593,7 @@ export default function ChatWindow({
       const res = await fetch(`${API}/api/social-ai-bot/manual-reply`, {
         method: "POST",
         headers: { "Content-Type": "application/json", ...authHeaders },
-        body: JSON.stringify({ conversationId, message: msg }),
+        body: JSON.stringify({ conversationId, message: msg, replyToMessageId: (replyTo as any)?.id || null }),
       });
 
       if (!res.ok) {
@@ -513,6 +604,7 @@ export default function ChatWindow({
       }
 
       setText("");
+        setReplyTo(null);
       onSent?.();
     } catch (e: any) {
       console.error(e);
@@ -531,7 +623,6 @@ export default function ChatWindow({
 
       const form = new FormData();
       form.append("conversationId", conversationId);
-
       // ✅ multiple append
       files.forEach((f) => form.append("files", f));
 
@@ -549,6 +640,7 @@ export default function ChatWindow({
       }
 
       setFiles([]);
+        setReplyTo(null);
       onSent?.();
     } catch (e: any) {
       console.error(e);
@@ -565,6 +657,14 @@ export default function ChatWindow({
   };
 
   const headerId = useMemo(() => conversationId || "", [conversationId]);
+
+  const msgById = useMemo(() => {
+    const map = new Map<string, LiveMsg>();
+    for (const m of messages || []) {
+      if ((m as any)?.id != null) map.set(String((m as any).id), m);
+    }
+    return map;
+  }, [messages]);
 
   const sellerLabel = (s: any) => {
     const full = [s?.firstName, s?.lastName].filter(Boolean).join(" ").trim();
@@ -851,9 +951,10 @@ export default function ChatWindow({
           />
 
           {/* Bottom sheet */}
-          <div className="absolute inset-x-0 top-1/2 -translate-y-1/2 px-3">
+          <div className="absolute inset-x-0 top-1/2 -translate-y-1/2 px-3 flex justify-center">
 
-            <div className="w-full h-[50vh] md:h-[45vh] overflow-hidden rounded-2xl bg-white border-2 border-black shadow-2xl flex flex-col">
+            <div className="w-full md:w-1/2 h-[50vh] md:h-[45vh] overflow-hidden rounded-2xl bg-white border-2 border-black shadow-2xl flex flex-col">
+
             <div className="flex items-center justify-between gap-3 p-4 border-b border-gray-200 shrink-0">
               <div className="text-lg font-semibold">Saved items</div>
               <button
@@ -1129,6 +1230,9 @@ export default function ChatWindow({
       <div ref={listRef} className="flex-1 min-h-0 overflow-auto px-4 py-4 md:px-8 md:py-6">
         <div className="space-y-6">
           {messages.map((m, idx) => {
+            const msgKey = String(m.id ?? (m as any).messageId ?? `${idx}-${m.timestamp ?? ""}`);
+            const isMatch = normalizedSearch ? matchSet.has(msgKey) : false;
+            const isActive = normalizedSearch && matchKeys.length ? msgKey === matchKeys[activeMatch] : false;
             const isBot = m.sender === "bot";
             const time = m.timestamp ? new Date(m.timestamp).toLocaleString() : "";
 
@@ -1194,13 +1298,75 @@ export default function ChatWindow({
 
             return (
               <div
-                key={`${m.timestamp}-${idx}`}
-                className={["w-full flex", isBot ? "justify-end" : "justify-start"].join(" ")}
+                key={msgKey}
+                ref={(el) => {
+                  if (el) msgRefs.current[msgKey] = el;
+                  else delete msgRefs.current[msgKey];
+                }}
+                className={["w-full flex items-start gap-2", isBot ? "justify-end" : "justify-start"].join(" ")}
               >
+                {isBot ? (
+                  <button
+                    type="button"
+                    className="shrink-0 mt-2 text-[14px] text-gray-700 hover:text-black"
+                    onClick={() => setReplyTo(m)}
+                    title="Reply"
+                  >
+                    ↩
+                  </button>
+                ) : null}
                 <div
-                  className={[
+                  onPointerDown={(e) => {
+                    // If user is interacting with a button/link/input (e.g., forward/reply), don't start swipe-to-reply.
+                    const t = e.target as HTMLElement | null;
+                    if (t && t.closest("button, a, input, textarea, select, [role='button']")) return;
+
+                    // Ignore non-primary button drags on desktop
+                    // (touch has button === -1 in many browsers)
+                    if (typeof (e as any).button === "number" && (e as any).button > 0) return;
+                    dragStateRef.current = { id: msgKey, startX: e.clientX, delta: 0 };
+                    setDraggingMsgId(msgKey);
+                    setDragDeltaX(0);
+                    try {
+                      (e.currentTarget as any).setPointerCapture?.(e.pointerId);
+                    } catch {}
+                  }}
+                  onPointerMove={(e) => {
+                    if (dragStateRef.current.id !== msgKey) return;
+                    const dx = e.clientX - dragStateRef.current.startX;
+
+                    // WhatsApp-like: swipe RIGHT to reply on incoming; swipe LEFT to reply on outgoing.
+                    const unclamped = isBot ? Math.min(0, dx) : Math.max(0, dx);
+                    const clamped = Math.max(-80, Math.min(80, unclamped));
+
+                    dragStateRef.current.delta = clamped;
+                    setDragDeltaX(clamped);
+                  }}
+                  onPointerUp={() => {
+                    if (dragStateRef.current.id !== msgKey) return;
+                    const delta = dragStateRef.current.delta;
+                    const threshold = 60;
+
+                    const shouldReply = (!isBot && delta > threshold) || (isBot && delta < -threshold);
+                    dragStateRef.current = { id: null, startX: 0, delta: 0 };
+                    setDraggingMsgId(null);
+                    setDragDeltaX(0);
+
+                    if (shouldReply) setReplyTo(m);
+                  }}
+                  onPointerCancel={() => {
+                    if (dragStateRef.current.id !== msgKey) return;
+                    dragStateRef.current = { id: null, startX: 0, delta: 0 };
+                    setDraggingMsgId(null);
+                    setDragDeltaX(0);
+                  }}
+                  style={msgKey === draggingMsgId ? { transform: `translateX(${dragDeltaX}px)` } : undefined}
+                  className={[                    "max-w-[780px] px-5 py-4 text-sm leading-relaxed",
+
                     "max-w-[780px] px-5 py-4 text-sm leading-relaxed",
                     "border-2 border-black rounded-xl bg-white",
+                    isMatch ? "outline outline-4 outline-yellow-300" : "",
+                    isActive ? "outline-yellow-500" : "",
                     "transition-colors duration-150 hover:bg-gray-50",
                   ].join(" ")}
                 >
@@ -1216,9 +1382,50 @@ export default function ChatWindow({
                           forward
                         </button>
                       ) : null}
-                      <div className="text-[11px] text-gray-500">{time}</div>
+<div className="text-[11px] text-gray-500">{time}</div>
                     </div>
                   </div>
+
+
+                  {m.replyToMessageId ? (() => {
+                    const ref = msgById.get(String(m.replyToMessageId));
+                    if (!ref) return null;
+                    const refIsBot = ref.sender === "bot";
+                    const refLabel = (() => {
+                      if (!refIsBot) return (ref.senderName || ref.customerName || title || "Customer").trim();
+                      if (ref.senderName) return String(ref.senderName).trim();
+                      if (ref.senderRole === "admin") return "Admin";
+                      if (ref.senderRole === "seller") return "Seller";
+                      if (ref.senderRole === "ai") return "AI Bot";
+                      return isAdmin ? "Admin" : "Seller";
+                    })();
+                    const refMedia = parseMediaMessage(String(ref.message || ""));
+                    const refText = String(ref.message || "").replace(/\s+/g, " ").trim();
+                    return (
+                      <div className="mb-3 rounded-lg border border-gray-200 bg-gray-50 px-3 py-2">
+                        <div className="text-[11px] font-semibold text-gray-700">{refLabel}</div>
+
+                        {refMedia.images.length > 0 ? (
+                          <div className="mt-2 flex items-center gap-2 overflow-hidden">
+                            {refMedia.images.slice(0, 3).map((u, i) => (
+                              <img
+                                key={`${u}-${i}`}
+                                src={u}
+                                alt="replied media"
+                                className="h-10 w-10 rounded-md border border-gray-200 object-cover bg-white"
+                                loading="lazy"
+                              />
+                            ))}
+                            {refMedia.images.length > 3 ? (
+                              <div className="text-[11px] text-gray-500">+{refMedia.images.length - 3}</div>
+                            ) : null}
+                          </div>
+                        ) : (
+                          <div className="text-[12px] text-gray-600 truncate">{refText}</div>
+                        )}
+                      </div>
+                    );
+                  })() : null}
 
                   {/* ✅ Display text if available */}
                   {displayText && (
@@ -1263,6 +1470,16 @@ export default function ChatWindow({
                     <div className="whitespace-pre-wrap">{m.message}</div>
                   )}
                 </div>
+                {!isBot ? (
+                  <button
+                    type="button"
+                    className="shrink-0 mt-2 text-[14px] text-gray-700 hover:text-black"
+                    onClick={() => setReplyTo(m)}
+                    title="Reply"
+                  >
+                    ↪
+                  </button>
+                ) : null}
               </div>
             );
           })}
@@ -1272,7 +1489,117 @@ export default function ChatWindow({
       {/* Divider */}
       <div className="w-full border-t-2 border-black" />
 
-      {/* Bottom pill input (like screenshot) */}
+      {/* 🔎 Search bar */}
+{searchOpen ? (
+  <div className="px-4 md:px-16 pt-3">
+    <div className="flex items-center gap-2">
+      <div className="flex-1 bg-white rounded-full border-2 border-black px-4 py-2 flex items-center gap-2">
+        <span className="text-sm">🔎</span>
+        <input
+          value={searchQ}
+          onChange={(e) => setSearchQ(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") jumpToMatch(0);
+            if (e.key === "Escape") {
+              setSearchOpen(false);
+              setSearchQ("");
+            }
+          }}
+          placeholder="Search messages in this chat…"
+          className="flex-1 outline-none text-sm"
+        />
+        {normalizedSearch ? (
+          <span className="text-xs text-gray-600 whitespace-nowrap">
+            {matchKeys.length ? `${activeMatch + 1}/${matchKeys.length}` : "0/0"}
+          </span>
+        ) : null}
+      </div>
+
+      <button
+        type="button"
+        className="w-10 h-10 rounded-full border-2 border-black bg-white flex items-center justify-center disabled:opacity-50"
+        title="Previous match"
+        disabled={!matchKeys.length}
+        onClick={() => jumpToMatch(activeMatch - 1)}
+      >
+        ‹
+      </button>
+      <button
+        type="button"
+        className="w-10 h-10 rounded-full border-2 border-black bg-white flex items-center justify-center disabled:opacity-50"
+        title="Next match"
+        disabled={!matchKeys.length}
+        onClick={() => jumpToMatch(activeMatch + 1)}
+      >
+        ›
+      </button>
+
+      <button
+        type="button"
+        className="w-10 h-10 rounded-full border-2 border-black bg-white flex items-center justify-center"
+        title="Close search"
+        onClick={() => {
+          setSearchOpen(false);
+          setSearchQ("");
+        }}
+      >
+        ✕
+      </button>
+    </div>
+  </div>
+) : null}
+
+{/* Reply preview (WhatsApp/Facebook style) */}
+{replyTo ? (
+  <div className="px-4 md:px-16 pt-3">
+    <div className="rounded-2xl border-2 border-black bg-white px-4 py-3 flex items-start justify-between gap-3">
+      <div className="min-w-0">
+        <div className="text-xs font-semibold text-gray-800">
+          You replied to {(replyTo.sender === "customer"
+            ? (replyTo.senderName || replyTo.customerName || title || "Customer")
+            : (replyTo.senderName || (replyTo.senderRole === "admin" ? "Admin" : replyTo.senderRole === "seller" ? "Seller" : replyTo.senderRole === "ai" ? "AI Bot" : "Agent"))
+          )}
+        </div>
+        {(() => {
+          const pm = parseMediaMessage(String(replyTo.message || ""));
+          if (pm.images.length > 0) {
+            return (
+              <div className="mt-2 flex items-center gap-2 overflow-x-auto">
+                {pm.images.slice(0, 4).map((src, i) => (
+                  // eslint-disable-next-line @next/next/no-img-element
+                  <img
+                    key={src + i}
+                    src={src}
+                    alt="reply preview"
+                    className="w-12 h-12 rounded-xl border-2 border-black object-cover flex-shrink-0"
+                  />
+                ))}
+                {pm.images.length > 4 ? (
+                  <div className="text-xs text-gray-600 whitespace-nowrap">+{pm.images.length - 4} more</div>
+                ) : null}
+              </div>
+            );
+          }
+          return (
+            <div className="text-xs text-gray-600 truncate mt-1">
+              {String(replyTo.message || "").replace(/\s+/g, " ").trim()}
+            </div>
+          );
+        })()}
+      </div>
+      <button
+        type="button"
+        className="w-8 h-8 rounded-full border-2 border-black bg-white flex items-center justify-center"
+        title="Cancel reply"
+        onClick={() => setReplyTo(null)}
+      >
+        ✕
+      </button>
+    </div>
+  </div>
+) : null}
+
+{/* Bottom pill input (like screenshot) */}
       <div className="px-4 md:px-16 pb-4 md:pb-6">
         <div className="bg-[#2b2b2b] rounded-full px-4 py-3 flex items-center gap-3 shadow-inner">
           {/* hidden file input */}
@@ -1297,7 +1624,9 @@ export default function ChatWindow({
             +
           </button>
 
-          {/* input */}
+
+          
+{/* input */}
           <input
             value={text}
             onChange={(e) => setText(e.target.value)}
@@ -1319,6 +1648,22 @@ export default function ChatWindow({
           >
             ★
           </button>
+
+{/* search */}
+<button
+  type="button"
+  onClick={() => {
+    setSearchOpen(true);
+    // If user typed something in the message box and search is empty, use that as initial query.
+    // (Does not clear the message draft.)
+    if (!searchQ.trim() && text.trim()) setSearchQ(text.trim());
+  }}
+  disabled={!conversationId}
+  className="w-10 h-10 rounded-full flex items-center justify-center text-white text-lg hover:bg-[#3a3a3a] disabled:opacity-50"
+  title="Search in chat"
+>
+  🔎
+</button>
 
           {/* send */}
           <button

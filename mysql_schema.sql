@@ -40,13 +40,15 @@ CREATE TABLE IF NOT EXISTS social_chat_messages (
   sender_role ENUM('customer','admin','seller','ai') DEFAULT 'customer',
   sender_name VARCHAR(255) DEFAULT '',
   message MEDIUMTEXT NOT NULL,
-  platform ENUM('facebook','instagram') NOT NULL,
+    reply_to_message_id VARCHAR(36) NULL,
+platform ENUM('facebook','instagram') NOT NULL,
   page_id VARCHAR(64) NOT NULL,
   timestamp DATETIME NOT NULL,
   created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   KEY idx_conv_time (conversation_id, timestamp),
-  KEY idx_time (timestamp)
+  KEY idx_time (timestamp),
+  KEY idx_reply (reply_to_message_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 -- ✅ API Integrations

@@ -30,6 +30,7 @@ type LiveMsg = {
   conversationId: string;
   customerName: string;
   customerProfilePic?: string;
+  replyToMessageId?: string | number | null;
   sender: "customer" | "bot";
   senderRole?: "customer" | "admin" | "seller" | "ai";
   senderName?: string;
@@ -176,7 +177,7 @@ const getPageTokenByPageId = (pageId: string) => {
   // ✅ Always read latest env (API Integration UI can update runtime env without restart)
   const PAGE_TOKENS: Record<string, string> = buildTokenMap();
   const tok = String(PAGE_TOKENS[pid] || "").trim();
-  if (!tok) console.log("❌ Page token not found for pageId:", pid);
+  // if (!tok) console.log("❌ Page token not found for pageId:", pid);
   return tok;
 };
 
@@ -211,6 +212,7 @@ type DbMessage = {
   senderRole: "customer" | "admin" | "seller" | "ai";
   senderName: string;
   message: string;
+  replyToMessageId?: string | null;
   platform: "facebook" | "instagram";
   pageId: string;
   timestamp: Date;
@@ -219,8 +221,8 @@ type DbMessage = {
 const insertMessage = async (m: DbMessage) => {
   await execResult(
     `INSERT INTO social_chat_messages
-      (conversation_id, customer_name, customer_profile_pic, sender, sender_role, sender_name, message, platform, page_id, timestamp)
-     VALUES (?,?,?,?,?,?,?,?,?,?)`,
+      (conversation_id, customer_name, customer_profile_pic, sender, sender_role, sender_name, message, reply_to_message_id, platform, page_id, timestamp)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
     [
       m.conversationId,
       m.customerName,
@@ -229,6 +231,7 @@ const insertMessage = async (m: DbMessage) => {
       m.senderRole,
       m.senderName,
       m.message,
+      m.replyToMessageId || null,
       m.platform,
       m.pageId,
       m.timestamp,
@@ -275,7 +278,7 @@ const enforceSellerConversationLock = async (conversationId: string, sellerId: s
 
 const getMessagesByConversationDb = async (conversationId: string) => {
   return queryRows<any[]>(
-    "SELECT id, conversation_id AS conversationId, customer_name AS customerName, customer_profile_pic AS customerProfilePic, sender, sender_role AS senderRole, sender_name AS senderName, message, platform, page_id AS pageId, timestamp FROM social_chat_messages WHERE conversation_id=? ORDER BY timestamp ASC LIMIT 500",
+    "SELECT id, conversation_id AS conversationId, customer_name AS customerName, customer_profile_pic AS customerProfilePic, sender, sender_role AS senderRole, sender_name AS senderName, message, reply_to_message_id AS replyToMessageId, platform, page_id AS pageId, timestamp FROM social_chat_messages WHERE conversation_id=? ORDER BY timestamp ASC LIMIT 500",
     [conversationId]
   );
 };
@@ -425,6 +428,36 @@ const guessExtFromUrl = (u: string): string => {
   return "";
 };
 
+
+const guessMimeFromUrl = (u: string): string => {
+  const ext = guessExtFromUrl(u).toLowerCase();
+  if (ext === ".jpg" || ext === ".jpeg") return "image/jpeg";
+  if (ext === ".png") return "image/png";
+  if (ext === ".gif") return "image/gif";
+  if (ext === ".webp") return "image/webp";
+  if (ext === ".mp4") return "video/mp4";
+  if (ext === ".mov") return "video/quicktime";
+  if (ext === ".m4v") return "video/mp4";
+  if (ext === ".pdf") return "application/pdf";
+  // generic fallbacks
+  return "";
+};
+
+const fetchRemoteContentType = async (url: string): Promise<string> => {
+  try {
+    const resp = await axios.head(url, {
+      maxRedirects: 5,
+      timeout: 4000,
+      validateStatus: (s) => s >= 200 && s < 400,
+    });
+    const ct = String((resp.headers as any)?.["content-type"] || "").split(";")[0].trim();
+    return ct;
+  } catch {
+    return "";
+  }
+};
+
+
 const downloadRemoteMediaToUploads = async (remoteUrl: string): Promise<string | null> => {
   try {
     if (!isHttpUrl(remoteUrl)) return null;
@@ -530,6 +563,28 @@ const sendFacebookAttachmentById = async (
     },
   });
 };
+
+
+const sendFacebookAttachmentByUrl = async (
+  psid: string,
+  type: "image" | "video" | "file",
+  url: string,
+  token: string
+) => {
+  const safeUrl = String(url || "").trim();
+  if (!safeUrl) throw new Error("Missing media url");
+  await axios.post(`https://graph.facebook.com/v19.0/me/messages?access_token=${token}`, {
+    messaging_type: "RESPONSE",
+    recipient: { id: psid },
+    message: {
+      attachment: {
+        type,
+        payload: { url: safeUrl, is_reusable: false },
+      },
+    },
+  });
+};
+
 
 const sendInstagramMessage = async (
   igBusinessId: string,
@@ -1255,11 +1310,31 @@ const handleFacebookWebhook = async (req: Request, res: Response) => {
 /* ====================== UI: MANUAL REPLY (KEEP ROUTE COMPAT) ====================== */
 const manualReply = async (req: Request, res: Response) => {
   try {
-    const { conversationId, message } = req.body || {};
+    const { conversationId, message, sendAs, replyToMessageId } = req.body || {};
     const msg = normalizeText(message);
+    let mode = String(sendAs || "agent").toLowerCase(); // agent|customer
 
     if (!conversationId || !msg)
       return res.status(400).json({ message: "conversationId and message required" });
+
+    // If replying to a specific message, auto-swap sender like Facebook/WhatsApp inbox.
+    const replyToId = replyToMessageId != null ? String(replyToMessageId).trim() : "";
+    if (replyToId) {
+      try {
+        const rows = await queryRows<any>(
+          "SELECT id, sender, sender_role AS senderRole FROM social_chat_messages WHERE id=? LIMIT 1",
+          [replyToId]
+        );
+        const ref = rows?.[0];
+        const refIsCustomer =
+          String(ref?.sender || "").toLowerCase() === "customer" ||
+          String(ref?.senderRole || "").toLowerCase() === "customer";
+        mode = refIsCustomer ? "agent" : "customer";
+      } catch {
+        // If we can't resolve the reference message, fall back to explicit sendAs/default.
+      }
+    }
+
 
     // seller lock enforcement (STRICT)
     // IMPORTANT: Do not allow sending a reply unless we successfully lock/assign.
@@ -1282,9 +1357,7 @@ const manualReply = async (req: Request, res: Response) => {
     if (!pageId || !recipientId)
       return res.status(400).json({ message: "Invalid conversationId" });
 
-    const token = getPageTokenByPageId(pageId);
-    if (!token) return res.status(400).json({ message: "Page token not found" });
-
+    // Read last meta to keep customer identity stable and infer platform.
     const lastRows = await queryRows<any[]>(
       "SELECT platform, page_id AS pageId, customer_name AS customerName, customer_profile_pic AS customerProfilePic FROM social_chat_messages WHERE conversation_id=? ORDER BY timestamp DESC LIMIT 1",
       [conversationId]
@@ -1294,66 +1367,52 @@ const manualReply = async (req: Request, res: Response) => {
     const platform = (last?.platform ||
       (isInstagramPage(pageId) ? "instagram" : "facebook")) as "facebook" | "instagram";
 
-    // ✅ If the Admin/Seller panel sends media as `/uploads/...` links inside the message,
-    // send those as real attachments to the customer (instead of plain text links).
-    // This keeps the panel UX (single bubble gallery) while ensuring customer inbox shows the actual image/video.
-    const candidateUrls = extractAllUrlsFromText(msg).filter((u) => String(u || "").includes("/uploads/"));
-    if (candidateUrls.length) {
-      const base = getPublicBaseUrl(req);
-
-      // Remove common label prefixes used by panel bubbles
-      const cleanedText = normalizeText(
-        msg
-          .replace(/^📷\s*Images?:\s*/i, "")
-          .replace(/^🎥\s*Videos?:\s*/i, "")
-          .replace(/^📎\s*Attachments?:\s*/i, "")
-      );
-
-      // Send each attachment (Meta APIs typically accept one per call)
-      for (const u of candidateUrls) {
-        const filename = safeUploadFilenameFromUrl(u);
-        if (!filename) continue;
-
-        const rel = `/uploads/${encodeURIComponent(filename)}`;
-        const abs = `${base}${rel}`;
-
-        const type: "image" | "video" | "file" =
-          isVideoFile(filename) ? "video" : isImageFile(filename) ? "image" : "file";
-
-        try {
-          if (platform === "instagram") {
-            await sendInstagramAttachment(pageId, recipientId, type, abs, token);
-          } else {
-            const localPath = path.join(process.cwd(), "uploads", filename);
-            const mimetype = guessMimeFromFilename(filename);
-            const attachmentId = await uploadFacebookAttachment(type, localPath, mimetype, token);
-            await sendFacebookAttachmentById(recipientId, type, attachmentId, token);
-          }
-        } catch (e) {
-          console.error("PANEL MEDIA SEND ERROR:", lastErr(e));
-        }
-      }
-
-      // If there's remaining human text besides the URLs, send it as a normal message.
-      // (We intentionally strip the URLs so the customer doesn't see link spam.)
-      const remaining = normalizeText(
-        cleanedText
-          .split(/\r?\n/)
-          .filter((line) => !extractAllUrlsFromText(line).some((u) => String(u || "").includes("/uploads/")))
-          .join("\n")
-      );
-
-      if (remaining) {
-        if (platform === "instagram") await sendInstagramMessage(pageId, recipientId, remaining, token);
-        else await sendFacebookMessage(recipientId, remaining, token);
-      }
-    } else {
-      if (platform === "instagram") await sendInstagramMessage(pageId, recipientId, msg, token);
-      else await sendFacebookMessage(recipientId, msg, token);
-    }
-
     const customerName = safeString((last as any)?.customerName) || recipientId;
     const customerProfilePic = safeString((last as any)?.customerProfilePic) || "";
+
+    // ======= NEW: "swap" mode (simulate customer message in inbox) =======
+    // If sendAs=customer, we DO NOT send anything to Meta.
+    // We only store & broadcast a "customer" message so admin/seller can test/continue
+    // the conversation from either side like FB/WhatsApp inbox tools.
+    if (mode === "customer") {
+      const ts = new Date();
+      await insertMessage({
+        conversationId,
+        customerName,
+        customerProfilePic,
+        sender: "customer",
+        senderRole: "customer",
+        senderName: customerName || "Customer",
+        message: msg,
+        replyToMessageId: replyToId || null,
+        platform,
+        pageId,
+        timestamp: ts,
+      });
+
+      emitLiveMessage(req, {
+        conversationId,
+        customerName,
+        customerProfilePic,
+        sender: "customer",
+        senderRole: "customer",
+        senderName: customerName || "Customer",
+        message: msg,
+        replyToMessageId: replyToId || null,
+        platform,
+        pageId,
+        timestamp: ts.toISOString(),
+      });
+
+      return res.json({ ok: true });
+    }
+
+    // ======= Default: agent message (existing behavior) =======
+    const token = getPageTokenByPageId(pageId);
+    if (!token) return res.status(400).json({ message: "Page token not found" });
+
+    if (platform === "instagram") await sendInstagramMessage(pageId, recipientId, msg, token);
+    else await sendFacebookMessage(recipientId, msg, token);
 
     const actor = await resolveBotActor(req);
 
@@ -1366,10 +1425,11 @@ const manualReply = async (req: Request, res: Response) => {
       senderRole: actor.senderRole,
       senderName: actor.senderName,
       message: msg,
+        replyToMessageId: replyToId || null,
       platform,
       pageId,
       timestamp: ts,
-    });
+      });
 
     emitLiveMessage(req, {
       conversationId,
@@ -1379,10 +1439,11 @@ const manualReply = async (req: Request, res: Response) => {
       senderRole: actor.senderRole,
       senderName: actor.senderName,
       message: msg,
+        replyToMessageId: replyToId || null,
       platform,
       pageId,
       timestamp: ts.toISOString(),
-    });
+      });
 
     return res.json({ ok: true });
   } catch (err: any) {
@@ -1394,9 +1455,30 @@ const manualReply = async (req: Request, res: Response) => {
 const manualMediaReply = async (req: Request, res: Response) => {
   try {
     const conversationId = safeString((req.body as any)?.conversationId);
+    const replyToMessageId = safeString((req.body as any)?.replyToMessageId);
+    let mode = String((req.body as any)?.sendAs || "agent").toLowerCase(); // agent|customer
     if (!conversationId) {
       return res.status(400).json({ message: "conversationId required" });
     }
+
+    // If replying to a specific message, auto-swap sender like Facebook/WhatsApp inbox.
+    const replyToId = replyToMessageId ? String(replyToMessageId).trim() : "";
+    if (replyToId) {
+      try {
+        const rows = await queryRows<any>(
+          "SELECT id, sender, sender_role AS senderRole FROM social_chat_messages WHERE id=? LIMIT 1",
+          [replyToId]
+        );
+        const ref = rows?.[0];
+        const refIsCustomer =
+          String(ref?.sender || "").toLowerCase() === "customer" ||
+          String(ref?.senderRole || "").toLowerCase() === "customer";
+        mode = refIsCustomer ? "agent" : "customer";
+      } catch {
+        // fall back
+      }
+    }
+
 
     // seller lock enforcement (STRICT, same rules as manualReply)
     if (getReqUser(req)?.role === "seller") {
@@ -1418,8 +1500,8 @@ const manualMediaReply = async (req: Request, res: Response) => {
       return res.status(400).json({ message: "Invalid conversationId" });
     }
 
-    const token = getPageTokenByPageId(pageId);
-    if (!token) return res.status(400).json({ message: "Page token not found" });
+    const token = mode === "customer" ? "" : getPageTokenByPageId(pageId);
+    if (mode !== "customer" && !token) return res.status(400).json({ message: "Page token not found" });
 
     const lastRows = await queryRows<any[]>(
       "SELECT platform, page_id AS pageId, customer_name AS customerName, customer_profile_pic AS customerProfilePic FROM social_chat_messages WHERE conversation_id=? ORDER BY timestamp DESC LIMIT 1",
@@ -1477,7 +1559,8 @@ const manualMediaReply = async (req: Request, res: Response) => {
       const type: "image" | "video" | "file" = isVid ? "video" : isImg ? "image" : "file";
 
       try {
-        if (platform === "instagram") {
+        if (mode !== "customer") {
+          if (platform === "instagram") {
           // IG requires a publicly reachable URL
           await sendInstagramAttachment(pageId, recipientId, type, absoluteUrl, token);
         } else {
@@ -1489,6 +1572,7 @@ const manualMediaReply = async (req: Request, res: Response) => {
             token
           );
           await sendFacebookAttachmentById(recipientId, type, attachmentId, token);
+          }
         }
       } catch (e) {
         console.error("MEDIA SEND ERROR:", lastErr(e));
@@ -1531,13 +1615,14 @@ const manualMediaReply = async (req: Request, res: Response) => {
 
     const actor = await resolveBotActor(req);
 
+    const asCustomer = mode === "customer";
     await insertMessage({
       conversationId,
       customerName,
       customerProfilePic,
-      sender: "bot",
-      senderRole: actor.senderRole,
-      senderName: actor.senderName,
+      sender: asCustomer ? "customer" : "bot",
+      senderRole: asCustomer ? "customer" : actor.senderRole,
+      senderName: asCustomer ? (customerName || "Customer") : actor.senderName,
       message: storedMessage,
       platform,
       pageId,
@@ -1548,9 +1633,9 @@ const manualMediaReply = async (req: Request, res: Response) => {
       conversationId,
       customerName,
       customerProfilePic,
-      sender: "bot",
-      senderRole: actor.senderRole,
-      senderName: actor.senderName,
+      sender: asCustomer ? "customer" : "bot",
+      senderRole: asCustomer ? "customer" : actor.senderRole,
+      senderName: asCustomer ? (customerName || "Customer") : actor.senderName,
       message: storedMessage,
       platform,
       pageId,
@@ -1656,12 +1741,19 @@ const forwardMessage = async (req: Request, res: Response) => {
 
     // Decide whether this looks like a media bubble we can forward
     const urls = extractAllUrlsFromText(rawMessage);
-    // Treat URLs as forwardable if they reference our `/uploads/` files (relative or absolute)
-    const uploadUrls = urls.filter((u) => Boolean(safeUploadFilenameFromUrl(u)));
 
-    const hasForwardableUploads = uploadUrls.length > 0;
+// We support forwarding:
+// 1) Local files previously downloaded to /uploads (relative or absolute URL to our server)
+// 2) Remote https URLs (Meta CDN, etc.) by sending attachment via URL when possible
+const uploadUrls = urls.filter((u) => Boolean(safeUploadFilenameFromUrl(u)));
+const remoteUrls = urls.filter((u) => {
+  const s = String(u || "").trim();
+  return (s.startsWith("http://") || s.startsWith("https://")) && !safeUploadFilenameFromUrl(s);
+});
 
-    if (!hasForwardableUploads) {
+const hasForwardableMedia = uploadUrls.length > 0 || remoteUrls.length > 0;
+
+    if (!hasForwardableMedia) {
       // Plain text forward
       const msg = normalizeText(rawMessage);
       if (!msg) return res.status(400).json({ message: "message required" });
@@ -1737,7 +1829,42 @@ const forwardMessage = async (req: Request, res: Response) => {
       storedKinds.push(type);
     }
 
-    if (!storedMediaUrls.length) {
+    
+    // Also try forwarding remote URLs (e.g., Meta CDN) via URL payload
+    for (const u of remoteUrls) {
+      const raw = String(u || "").trim();
+      if (!raw) continue;
+
+      // Guess media type robustly (prefer actual content-type, then URL extension)
+      const basename = (() => {
+        try { return path.basename(new URL(raw).pathname || ""); } catch { return path.basename(raw); }
+      })();
+
+      const hintedMime = guessMimeFromFilename(basename) || guessMimeFromUrl(raw);
+      const fetchedMime = hintedMime ? "" : await fetchRemoteContentType(raw);
+      const mime = (hintedMime || fetchedMime || "application/octet-stream").toLowerCase();
+
+      const type: "image" | "video" | "file" =
+        mime.startsWith("video/") ? "video" :
+        mime.startsWith("image/") ? "image" :
+        "file";
+
+      try {
+        if (platform === "instagram") {
+          await sendInstagramAttachment(pageId, recipientId, type, raw, token);
+        } else {
+          await sendFacebookAttachmentByUrl(recipientId, type, raw, token);
+        }
+      } catch (e) {
+        console.error("FORWARD REMOTE MEDIA SEND ERROR:", lastErr(e));
+      }
+
+      // Store as-is (remote URL) so UI can render it
+      storedMediaUrls.push(raw);
+      storedKinds.push(type);
+    }
+
+if (!storedMediaUrls.length) {
       // Fallback: forward as plain text with URLs
       const msg = normalizeText(rawMessage);
       if (platform === "instagram") await sendInstagramMessage(pageId, recipientId, msg, token);
